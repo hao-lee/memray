@@ -19,6 +19,10 @@ from setuptools.command.build_ext import build_ext as build_ext_orig
 
 IS_MAC = sys.platform == "darwin"
 IS_LINUX = "linux" in sys.platform
+try:
+    HAVE_DEBUGINFOD = IS_LINUX and pkgconfig.exists("libdebuginfod")
+except (EnvironmentError, pkgconfig.PackageNotFoundError):
+    HAVE_DEBUGINFOD = False
 
 LIBBACKTRACE_LOCATION = (
     pathlib.Path(__file__).parent / "src" / "vendor" / "libbacktrace"
@@ -74,10 +78,18 @@ class BuildMemray(build_ext_orig):
         if libbacktrace_target is not None:
             configure_cmd.extend(["--host", libbacktrace_target])
 
+        configure_env = os.environ.copy()
+        if HAVE_DEBUGINFOD:
+            cppflags = configure_env.get("CPPFLAGS", "")
+            configure_env["CPPFLAGS"] = (
+                f"{cppflags} -DHAVE_DEBUGINFOD=1".strip()
+            )
+
         with tempfile.TemporaryDirectory() as tmpdirname:
             self.announce_and_run(
                 configure_cmd,
                 cwd=tmpdirname,
+                env=configure_env,
             )
             self.announce_and_run(["make", "-j"], cwd=tmpdirname)
             self.announce_and_run(["make", "install"], cwd=tmpdirname)
@@ -227,7 +239,9 @@ BINARY_FORMAT = BINARY_FORMATS.get(sys.platform, "elf")
 library_flags = {"libraries": ["lz4"]}
 if IS_LINUX:
     library_flags["libraries"].append("unwind")
-    library_flags["libraries"].append("debuginfod")
+    if HAVE_DEBUGINFOD:
+        library_flags["libraries"].append("debuginfod")
+        DEFINE_MACROS.append(("HAVE_DEBUGINFOD", "1"))
 
 try:
     library_flags = pkgconfig.parse(

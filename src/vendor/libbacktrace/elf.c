@@ -51,7 +51,9 @@ POSSIBILITY OF SUCH DAMAGE.  */
 
 #include "backtrace.h"
 #include "internal.h"
+#ifdef HAVE_DEBUGINFOD
 #include "debuginfod_support.h"
+#endif
 
 #ifndef S_ISLNK
  #ifndef S_IFLNK
@@ -863,6 +865,7 @@ elf_readlink (struct backtrace_state *state, const char *filename,
 
 static int debuginfod_guard = 0;
 
+#ifdef HAVE_DEBUGINFOD
 static int
 elf_open_debugfile_by_debuginfod (const char *buildid_data,
 			       size_t buildid_size,
@@ -892,6 +895,20 @@ elf_open_debugfile_by_debuginfod (const char *buildid_data,
 
   return ret;
 }
+#else
+static int
+elf_open_debugfile_by_debuginfod (const char *buildid_data,
+			       size_t buildid_size,
+			       backtrace_error_callback error_callback,
+			       void *data)
+{
+  (void) buildid_data;
+  (void) buildid_size;
+  (void) error_callback;
+  (void) data;
+  return -1;
+}
+#endif
 
 
 /* Open a separate debug info file, using the build ID to find it.
@@ -6985,10 +7002,12 @@ elf_add (struct backtrace_state *state, const char *filename, int descriptor,
       d = elf_open_debugfile_by_buildid (state, buildid_data, buildid_size,
 					 error_callback, data);
       if (d < 0 && !debuginfod_guard) {
+#ifdef HAVE_DEBUGINFOD
           char* env = getenv(DEBUGINFOD_PROGRESS_ENV_VAR);
           if (env) {
             fprintf(stderr, "Trying to download debuginfo for %s\n", filename);
           }
+#endif
           d = elf_open_debugfile_by_debuginfod(buildid_data, buildid_size,
                                                error_callback, data);
       }
