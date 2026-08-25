@@ -35,6 +35,7 @@ PyAPI_FUNC(PyObject*) PyUnicode_AsUTF8String(PyObject* unicode);
 PyAPI_FUNC(PyObject*) Py_CompileString(const char*, const char*, int);
 PyAPI_FUNC(void) Py_DecRef(PyObject*);
 PyAPI_FUNC(int) Py_IsInitialized(void);
+PyAPI_FUNC(int) Py_AddPendingCall(int (*func)(void*), void* arg);
 
 namespace memray {
 namespace {  // unnamed
@@ -49,7 +50,9 @@ connect_client(const uint16_t port)
     hints.ai_socktype = SOCK_STREAM;
 
     const std::string port_str = std::to_string(port);
-    const int rv = ::getaddrinfo(nullptr, port_str.c_str(), &hints, &all_addresses);
+    // Huatuo's control listener is bound to the target network namespace's
+    // IPv4 loopback address.
+    const int rv = ::getaddrinfo("127.0.0.1", port_str.c_str(), &hints, &all_addresses);
     if (rv != 0) {
         std::cerr << "getaddrinfo() failed while trying to attach Memray: " << ::gai_strerror(rv);
         return -1;
@@ -236,6 +239,16 @@ run_client(const uint16_t port)
     ::close(sock);
 }
 
+// Run the control client from the interpreter's main thread when the embedding
+// profiler cannot safely start a new pthread in the target process.
+static int
+pending_call_client(void* arg)
+{
+    int port = static_cast<int>(reinterpret_cast<uintptr_t>(arg));
+    run_client(static_cast<uint16_t>(port));
+    return 0;
+}
+
 extern "C" void*
 thread_body(void* arg)
 {
@@ -262,4 +275,13 @@ memray_spawn_client(int port)
     // a new thread that will try to grab the GIL and run the code there.
     pthread_t thread;
     return pthread_create(&thread, nullptr, &memray::thread_body, (void*)(uintptr_t)port);
+}
+
+extern "C" __attribute__((visibility("default"))) int
+memray_schedule_client_direct(int port)
+{
+    if (!Py_IsInitialized()) {
+        return -1;
+    }
+    return Py_AddPendingCall(&memray::pending_call_client, (void*)(uintptr_t)port);
 }
