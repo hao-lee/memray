@@ -1,5 +1,6 @@
 import distutils.command.build
 import distutils.log
+from distutils.version import LooseVersion
 import os
 import pathlib
 import subprocess
@@ -9,6 +10,7 @@ from sys import platform
 from sys import version_info
 
 import pkgconfig
+import Cython
 from Cython.Build import cythonize
 from setuptools import Extension
 from setuptools import find_packages
@@ -138,6 +140,9 @@ if os.getenv("CYTHON_TEST_MACROS", None) is not None:
     TEST_BUILD = True
 
 MINIMIZE_INLINING = os.getenv("MEMRAY_MINIMIZE_INLINING", "") != ""
+CYTHON_SUPPORTS_FREETHREADING = LooseVersion(
+    getattr(Cython, "__version__", "0")
+) >= LooseVersion("3.1")
 
 COMPILER_DIRECTIVES = {
     "language_level": 3,
@@ -149,8 +154,9 @@ COMPILER_DIRECTIVES = {
     "linetrace": False,
     "c_string_type": "unicode",
     "c_string_encoding": "utf8",
-    "freethreading_compatible": True,
 }
+if CYTHON_SUPPORTS_FREETHREADING:
+    COMPILER_DIRECTIVES["freethreading_compatible"] = True
 EXTRA_COMPILE_ARGS = []
 EXTRA_LINK_ARGS = []
 UNDEF_MACROS = []
@@ -181,8 +187,9 @@ if TEST_BUILD:
         "infer_types": True,
         "c_string_type": "unicode",
         "c_string_encoding": "utf8",
-        "freethreading_compatible": True,
     }
+    if CYTHON_SUPPORTS_FREETHREADING:
+        COMPILER_DIRECTIVES["freethreading_compatible"] = True
     EXTRA_COMPILE_ARGS = []
     UNDEF_MACROS = ["NDEBUG"]
     if IS_LINUX:
