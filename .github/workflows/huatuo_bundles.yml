@@ -9,6 +9,7 @@ on:
       - "pyproject.toml"
       - "setup.py"
       - "scripts/bundle_memray.py"
+      - "scripts/package_huatuo_bundle.py"
       - "src/**"
   push:
     tags:
@@ -32,6 +33,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Prepare runtime output
+        run: mkdir -p build/huatuo-runtime
+
       # cibuildwheel 3.x dropped CPython 3.7. Keep the final 2.x release
       # that supports it isolated from the actively supported interpreters.
       - name: Build and repair wheel
@@ -42,18 +46,34 @@ jobs:
             yum install -y lz4-devel libunwind-devel
           CIBW_BUILD: cp37-manylinux_${{ matrix.arch }}
           CIBW_BUILD_VERBOSITY: 1
+          CIBW_CONTAINER_ENGINE: >-
+            docker; create_args:
+            --volume=${{ github.workspace }}/build/huatuo-runtime:/huatuo-runtime
           CIBW_MANYLINUX_AARCH64_IMAGE: manylinux2014
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux2014
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
             auditwheel repair --wheel-dir {dest_dir} {wheel}
           CIBW_TEST_COMMAND: >-
-            python -c "import memray; print(memray.__version__)"
+            python {project}/scripts/bundle_memray.py
+            --python python
+            --wheel {wheel}
+            --clean
+            --output /huatuo-runtime/${{ matrix.arch }}/runtimes/py$(python -c
+            'import sys; print("%d.%d" % sys.version_info[:2])')
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
           name: huatuo-wheels-cp37-${{ matrix.arch }}
           path: wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: huatuo-runtime-cp37-${{ matrix.arch }}
+          path: build/huatuo-runtime/${{ matrix.arch }}/runtimes
           if-no-files-found: error
           retention-days: 14
 
@@ -71,6 +91,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Prepare runtime output
+        run: mkdir -p build/huatuo-runtime
+
       - name: Build and repair wheels
         uses: pypa/cibuildwheel@v3.1.4
         env:
@@ -79,12 +102,20 @@ jobs:
             yum install -y lz4-devel libunwind-devel
           CIBW_BUILD: cp3{8..14}-manylinux_${{ matrix.arch }}
           CIBW_BUILD_VERBOSITY: 1
+          CIBW_CONTAINER_ENGINE: >-
+            docker; create_args:
+            --volume=${{ github.workspace }}/build/huatuo-runtime:/huatuo-runtime
           CIBW_MANYLINUX_AARCH64_IMAGE: manylinux2014
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux2014
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
             auditwheel repair --wheel-dir {dest_dir} {wheel}
           CIBW_TEST_COMMAND: >-
-            python -c "import memray; print(memray.__version__)"
+            python {project}/scripts/bundle_memray.py
+            --python python
+            --wheel {wheel}
+            --clean
+            --output /huatuo-runtime/${{ matrix.arch }}/runtimes/py$(python -c
+            'import sys; print("%d.%d" % sys.version_info[:2])')
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -93,3 +124,101 @@ jobs:
           path: wheelhouse/*.whl
           if-no-files-found: error
           retention-days: 14
+
+      - name: Upload runtimes
+        uses: actions/upload-artifact@v4
+        with:
+          name: huatuo-runtime-current-${{ matrix.arch }}
+          path: build/huatuo-runtime/${{ matrix.arch }}/runtimes
+          if-no-files-found: error
+          retention-days: 14
+
+  package_bundles:
+    name: Package ${{ matrix.arch }} bundle
+    needs:
+      - build_python37_wheels
+      - build_current_wheels
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - x86_64
+          - aarch64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download runtimes
+        uses: actions/download-artifact@v4
+        with:
+          pattern: huatuo-runtime-*-${{ matrix.arch }}
+          path: build/merged/runtimes
+          merge-multiple: true
+
+      - name: Describe bundle
+        id: bundle
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/huatuo-bundle-v* ]]; then
+            version="${GITHUB_REF_NAME#huatuo-bundle-v}"
+          else
+            memray_version="$(awk -F'"' '/^__version__/ {print $2}' src/memray/_version.py)"
+            version="${memray_version}+${GITHUB_SHA:0:12}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source_date_epoch=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Package bundle
+        run: |
+          python3 scripts/package_huatuo_bundle.py \
+            --runtimes build/merged/runtimes \
+            --output dist \
+            --architecture "${{ matrix.arch }}" \
+            --bundle-version "${{ steps.bundle.outputs.version }}" \
+            --source-revision "$GITHUB_SHA" \
+            --source-date-epoch "${{ steps.bundle.outputs.source_date_epoch }}"
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: huatuo-bundle-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish_release:
+    name: Publish bundle release
+    if: startsWith(github.ref, 'refs/tags/huatuo-bundle-v')
+    needs: package_bundles
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: huatuo-bundle-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz *.manifest.json > SHA256SUMS
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --generate-notes \
+              --title "Huatuo Memray bundle $GITHUB_REF_NAME" \
+              --verify-tag \
+              --repo "$GITHUB_REPOSITORY"
+          fi

@@ -2,6 +2,9 @@
 """Create a relocatable Memray bundle for an embedding profiler."""
 
 import argparse
+import hashlib
+import json
+import os
 import shutil
 import subprocess
 import sys
@@ -33,18 +36,99 @@ def build_wheel(python: str, output: Path) -> Path:
 
 def install_wheel(python: str, wheel: Path, target: Path) -> None:
     target.mkdir(parents=True, exist_ok=True)
-    # Unlike memray-lite, the full package imports declared dependencies such
-    # as rich while loading memray._memray. Keep them in the staged runtime.
+    # Keep the declared dependency set so the bundled CLI and reporters remain
+    # usable as well as the injected tracker.
     run(
         [
             python,
             "-m",
             "pip",
             "install",
+            "--disable-pip-version-check",
+            "--no-cache-dir",
+            "--only-binary=:all:",
             "--target",
             str(target),
             str(wheel),
         ]
+    )
+
+
+def copy_attach_helpers(source_root: Path, target: Path) -> None:
+    source_commands = source_root / "src" / "memray" / "commands"
+    target_commands = target / "memray" / "commands"
+    target_commands.mkdir(parents=True, exist_ok=True)
+    for name in ("_attach.gdb", "_attach.lldb"):
+        source = source_commands / name
+        if not source.is_file():
+            raise RuntimeError(f"attach helper not found: {source}")
+        shutil.copy2(source, target_commands / name)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def installed_distributions(target: Path) -> list:
+    distributions = []
+    for metadata in sorted(target.glob("*.dist-info/METADATA")):
+        name = None
+        version = None
+        with metadata.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if line.startswith("Name: "):
+                    name = line[6:].strip()
+                elif line.startswith("Version: "):
+                    version = line[9:].strip()
+                if name is not None and version is not None:
+                    break
+        if name is not None and version is not None:
+            distributions.append({"name": name, "version": version})
+    return distributions
+
+
+def verify_runtime(python: str, target: Path) -> None:
+    memray_dir = target / "memray"
+    extensions = list(memray_dir.glob("_memray*.so"))
+    injectors = list(memray_dir.glob("_inject*.so"))
+    if len(extensions) != 1:
+        raise RuntimeError(f"expected one _memray extension, found {len(extensions)}")
+    if len(injectors) != 1:
+        raise RuntimeError(f"expected one _inject extension, found {len(injectors)}")
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(target)
+    run(
+        [
+            python,
+            "-c",
+            (
+                "import pathlib, memray; "
+                f"root = pathlib.Path({str(target)!r}).resolve(); "
+                "loaded = pathlib.Path(memray.__file__).resolve(); "
+                "assert str(loaded).startswith(str(root) + '/'), (root, loaded)"
+            ),
+        ],
+        env=env,
+    )
+
+
+def write_runtime_metadata(bundle_dir: Path, wheel: Path) -> None:
+    python_dir = bundle_dir / "python"
+    metadata = {
+        "schema_version": 1,
+        "python_version": f"{sys.version_info[0]}.{sys.version_info[1]}",
+        "source_wheel": wheel.name,
+        "source_wheel_sha256": sha256(wheel),
+        "distributions": installed_distributions(python_dir),
+    }
+    (bundle_dir / "runtime.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
 
 
@@ -88,6 +172,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="build/memray", type=Path)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--wheel", type=Path)
+    parser.add_argument(
+        "--source-root",
+        default=Path(__file__).resolve().parents[1],
+        type=Path,
+    )
     parser.add_argument("--clean", action="store_true")
     parser.add_argument("--tarball", action="store_true")
     return parser.parse_args()
@@ -105,7 +194,12 @@ def main() -> None:
         if wheel is None:
             temporary_dir = Path(tempfile.mkdtemp(prefix="memray-bundle-wheel"))
             wheel = build_wheel(args.python, temporary_dir)
-        install_wheel(args.python, wheel, bundle_dir / "python")
+        wheel = wheel.resolve()
+        python_dir = bundle_dir / "python"
+        install_wheel(args.python, wheel, python_dir)
+        copy_attach_helpers(args.source_root.resolve(), python_dir)
+        verify_runtime(args.python, python_dir)
+        write_runtime_metadata(bundle_dir, wheel)
         write_wrapper(bundle_dir / "bin")
         write_readme(bundle_dir)
         if args.tarball:
