@@ -1,0 +1,95 @@
+name: Huatuo runtime bundles
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/huatuo_bundles.yml"
+      - "MANIFEST.in"
+      - "pyproject.toml"
+      - "setup.py"
+      - "scripts/bundle_memray.py"
+      - "src/**"
+  push:
+    tags:
+      - "huatuo-bundle-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build_python37_wheels:
+    name: CPython 3.7 / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      # cibuildwheel 3.x dropped CPython 3.7. Keep the final 2.x release
+      # that supports it isolated from the actively supported interpreters.
+      - name: Build and repair wheel
+        uses: pypa/cibuildwheel@v2.23.3
+        env:
+          CIBW_ARCHS_LINUX: ${{ matrix.arch }}
+          CIBW_BEFORE_ALL_LINUX: >-
+            yum install -y lz4-devel libunwind-devel
+          CIBW_BUILD: cp37-manylinux_${{ matrix.arch }}
+          CIBW_BUILD_VERBOSITY: 1
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux2014
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux2014
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
+            auditwheel repair --wheel-dir {dest_dir} {wheel}
+          CIBW_TEST_COMMAND: >-
+            python -c "import memray; print(memray.__version__)"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: huatuo-wheels-cp37-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+  build_current_wheels:
+    name: CPython 3.8-3.14 / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and repair wheels
+        uses: pypa/cibuildwheel@v3.1.4
+        env:
+          CIBW_ARCHS_LINUX: ${{ matrix.arch }}
+          CIBW_BEFORE_ALL_LINUX: >-
+            yum install -y lz4-devel libunwind-devel
+          CIBW_BUILD: cp3{8..14}-manylinux_${{ matrix.arch }}
+          CIBW_BUILD_VERBOSITY: 1
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux2014
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux2014
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
+            auditwheel repair --wheel-dir {dest_dir} {wheel}
+          CIBW_TEST_COMMAND: >-
+            python -c "import memray; print(memray.__version__)"
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: huatuo-wheels-current-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: 14
